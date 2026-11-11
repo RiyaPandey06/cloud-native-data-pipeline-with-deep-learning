@@ -1,103 +1,475 @@
 # Cloud-Native PM2.5 Forecasting Pipeline
 
-A scheduled, containerized data pipeline. Every hour it pulls Open-Meteo air-quality and weather data, runs a quality gate, loads PostgreSQL raw / cleaned / feature layers idempotently, and scores a PyTorch forecaster. Models are trained weekly and compared honestly against strong baselines. Predictions are served by FastAPI and shown, with pipeline health, on a Streamlit dashboard. GitHub Actions tests and redeploys it on every push.
+<p align="center">
+  <b>An end-to-end, containerized data engineering and deep-learning project for hourly PM2.5 forecasting.</b>
+</p>
 
-The pipeline is the headline; the neural network shows it connects to ML.
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.11%2B-blue?logo=python" alt="Python">
+  <img src="https://img.shields.io/badge/PyTorch-Deep%20Learning-ee4c2c?logo=pytorch" alt="PyTorch">
+  <img src="https://img.shields.io/badge/FastAPI-API-009688?logo=fastapi" alt="FastAPI">
+  <img src="https://img.shields.io/badge/PostgreSQL-Database-4169e1?logo=postgresql" alt="PostgreSQL">
+  <img src="https://img.shields.io/badge/Docker-Compose-2496ed?logo=docker" alt="Docker">
+  <img src="https://img.shields.io/badge/Tests-37%20passed-success" alt="Tests">
+</p>
 
-> **Data limitation.** Open-Meteo air-quality values come from the CAMS ENSEMBLE *model*, not ground sensors. This project measures how well a model forecasts another model's output. See the [model card](docs/MODEL_CARD.md).
+A scheduled pipeline that ingests air-quality and weather data, validates and stores it in PostgreSQL, builds time-series features, trains and evaluates forecasting models, and serves forecasts through FastAPI and a Streamlit dashboard.
 
-![Architecture](docs/architecture.png)
+**The engineering focus is the complete, reproducible pipeline:** ingestion, data quality, idempotent storage, model evaluation, model registry, API serving, monitoring, and containerized orchestration.
 
-## Quick start
+> **Important data limitation:** The PM2.5 target comes from the CAMS ENSEMBLE atmospheric model through the Open-Meteo Air Quality API. It is **not ground-station sensor data**. The evaluation therefore measures forecasting performance against model-generated values, not measured pollution. This project is a technical demonstration, not a public-health or emergency decision system.
 
-```bash
-cp .env.example .env            # PowerShell: copy .env.example .env
-docker compose up --build
-```
+---
 
-- API docs: http://localhost:8000/docs  ·  Dashboard: http://localhost:8501
+## Contents
 
-The scheduler backfills `BACKFILL_DAYS` (90) on its first run, then fetches only what is new (plus a 48 h overlap to pick up source revisions). The trainer waits until there is at least a week of data, then retrains every 7 days.
+- [Project overview](#project-overview)
+- [Screenshots](#screenshots)
+- [Architecture](#architecture)
+- [Technology stack](#technology-stack)
+- [Pipeline workflow](#pipeline-workflow)
+- [Data and features](#data-and-features)
+- [Model training and evaluation](#model-training-and-evaluation)
+- [Results](#results)
+- [Data quality and reliability](#data-quality-and-reliability)
+- [Database design](#database-design)
+- [API reference](#api-reference)
+- [Run locally](#run-locally)
+- [Testing and code quality](#testing-and-code-quality)
+- [Project structure](#project-structure)
+- [Configuration](#configuration)
+- [Limitations and next steps](#limitations-and-next-steps)
+- [Documentation](#documentation)
+- [Data attribution](#data-attribution)
 
-Manual runs and recovery windows (safe to repeat; loads are idempotent):
+## Project overview
 
-```bash
-docker compose run --rm scheduler python scripts/run_pipeline.py --start 2026-08-01 --end 2026-10-29
-docker compose run --rm trainer   python scripts/train_model.py --architecture all   # or lstm / cnn
-```
+| Area | Implementation |
+|---|---|
+| Use case | Hourly PM2.5 time-series forecasting |
+| Default location | Bengaluru, India |
+| Data source | Open-Meteo Air Quality API and Weather API |
+| Air-quality target | CAMS ENSEMBLE modelled PM2.5 |
+| Ingestion cadence | Hourly |
+| Initial backfill | 90 days |
+| Incremental overlap | 48 hours, to capture late data and source revisions |
+| Forecast horizon | Next 24 hours |
+| Neural architectures | LSTM and 1D CNN |
+| Baselines | Persistence, seasonal naive, Gradient Boosting |
+| Database | PostgreSQL |
+| API | FastAPI |
+| Dashboard | Streamlit |
+| Orchestration | Docker Compose; optional Airflow DAG |
+| Deployment support | Google Cloud deployment scripts and an opt-in GitHub Actions workflow |
 
-Optional: run the same stages as an Airflow DAG for screenshots (see [design decisions](docs/DESIGN_DECISIONS.md)):
+## Screenshots
 
-```bash
-docker compose -f docker-compose.yml -f docker-compose.airflow.yml up --build db airflow
-```
+### System architecture
 
-## What it does, stage by stage
+![Cloud-native pipeline architecture](docs/architecture.png)
 
-| Stage | What happens | Where |
+The architecture diagram shows the data source, scheduled ingestion, validation, PostgreSQL storage layers, training/scoring components, API, and dashboard.
+
+### Application screenshots
+
+The repository currently includes the architecture diagram. Actual runtime screenshots of the Streamlit dashboard, API responses, and container services have not yet been added. They should be captured from a real local run rather than represented with mock images.
+
+Recommended screenshots to add under `docs/screenshots/`:
+
+| Suggested filename | What to capture |
+|---|---|
+| `dashboard-overview.png` | Streamlit dashboard with pipeline status, latest forecast, and model information |
+| `dashboard-forecast.png` | Forecast chart showing the next 24 hours |
+| `api-health.png` | FastAPI `/health` response and active model |
+| `api-predict.png` | FastAPI `/predict?horizon=6` response |
+| `docker-services.png` | Docker Compose services running |
+| `model-results.png` | Model comparison table or results report |
+
+Once captured, embed them here with Markdown image links, for example:
+`![Dashboard overview](docs/screenshots/dashboard-overview.png)`.
+
+## Architecture
+
+The pipeline is composed of independent stages so scheduled runs, manual backfills, and the optional Airflow DAG can reuse the same processing logic.
+
+**Main flow**
+
+1. Fetch hourly air-quality and weather data from Open-Meteo.
+2. Preserve the raw response and its SHA-256 hash.
+3. Validate schema, nulls, ranges, duplicates, continuity, freshness, and row volume.
+4. Transform valid observations and upsert them into PostgreSQL.
+5. Build lag, rolling-statistic, and calendar features.
+6. Train and evaluate baseline and neural forecasting models.
+7. Register model metadata and activate the best neural network by validation MAE.
+8. Generate a 24-hour forecast and expose it through FastAPI.
+9. Display forecasts and pipeline health in Streamlit.
+
+## Technology stack
+
+| Layer | Tools |
+|---|---|
+| Language | Python |
+| Data ingestion | Open-Meteo APIs, HTTP client, retry/backoff |
+| Data processing | pandas, NumPy |
+| Machine learning | scikit-learn |
+| Deep learning | PyTorch — LSTM, 1D CNN |
+| Database | PostgreSQL, SQLAlchemy |
+| API | FastAPI, Uvicorn |
+| Dashboard | Streamlit |
+| Scheduling and orchestration | Docker Compose scheduler, optional Apache Airflow |
+| Containers | Docker, Docker Compose |
+| Testing and quality | pytest, Ruff, pre-commit, Gitleaks |
+| Cloud deployment support | Google Cloud Run, Cloud SQL, Cloud Scheduler, GitHub Actions OIDC |
+
+## Pipeline workflow
+
+### 1. Ingestion
+
+- Retrieves air-quality and weather variables from Open-Meteo.
+- Uses retries with exponential backoff and jitter; respects `Retry-After` when provided.
+- Stores the original JSON response, request parameters, and SHA-256 hash.
+- Performs an initial 90-day backfill.
+- Subsequent runs fetch new data with a 48-hour overlap to account for delayed publication and source revisions.
+
+### 2. Data validation
+
+A quality gate runs before cleaned observations and features are written. Blocking failures prevent downstream writes; implausible batches are quarantined.
+
+| Check | Current rule | Action |
 |---|---|---|
-| Ingest | Fetch with retries, exponential backoff + jitter, `Retry-After` honoured. Raw JSON and a SHA-256 hash are kept. | `client.py`, `pipeline.py` |
-| Validate | Quality gate (below). Blocking results stop the run before any cleaned/feature write. | `quality.py` |
-| Load | Drop future model-forecast hours and not-yet-published newest hours, upsert on `(location, ts, source)`, rebuild features. | `transform.py`, `repository.py` |
-| Score | Active model forecasts the next 24 h; actuals are joined back as hours pass. A scoring error never undoes a clean load. | `scoring.py` |
-| Train (weekly) | Baselines + LSTM + 1D-CNN, hold-out **and** rolling-origin evaluation, per-horizon metrics; best network by validation MAE becomes active. | `evaluation.py`, `training.py`, `retrain.py` |
+| Schema | Required columns must exist and be numeric | Fail if invalid |
+| Key nulls | Timestamp/PM2.5 null share must be at most 1% | Drop permitted null rows; warn/fail based on threshold |
+| Range | PM2.5 in [0, 1000], PM10 in [0, 1500] | Quarantine implausible batch |
+| Duplicates | No duplicate timestamps | Fail |
+| Continuity | Gap over 2 hours warns; over 6 hours fails | Warn/fail |
+| Freshness | Newest row within 2 scheduling intervals | Warn and alert |
+| Volume | 80–110% of expected rows | Warn and alert |
 
-### Quality gate
+Thresholds are configurable and should be calibrated against a longer period of observed pipeline behaviour.
 
-| Check | Rule (thresholds are configurable and should be calibrated) | Outcome |
-|---|---|---|
-| schema | Required columns present and numeric | fail |
-| key_nulls | Null timestamp/PM2.5 share ≤ `MAX_NULL_SHARE` (1%) → rows dropped; more → fail | warn / fail |
-| range | PM2.5 / PM10 negative or above ceiling | **quarantine** (stored raw only) |
-| duplicates | Duplicate timestamps | fail |
-| continuity | Largest gap > 2 h warns, > 6 h fails | warn / fail |
-| freshness | Newest row older than 2 scheduling intervals | warn + alert |
-| volume | Rows outside 80–110% of what the window should hold | warn + alert |
+### 3. Transformation and storage
 
-Any fail, quarantine or warning sends a chat-webhook alert (`FAILURE_WEBHOOK_URL`). Calibrate ceilings after ~2 weeks with `python scripts/calibrate_quality.py`.
+- Removes future forecast timestamps and the newest hours that have not yet been published as observations.
+- Converts source data into typed hourly records.
+- Uses database upserts keyed by location, timestamp, and source.
+- Rebuilds time-series features after loading.
+- Keeps raw, cleaned, and feature data in separate logical layers.
 
-## API
+### 4. Training and scoring
 
-- `GET /health`: `ok` / `stale` / `degraded`, last successful run, freshness vs limit, active model.
-- `GET /predict?horizon=24`: latest forecast for the active model (404 until trained and scored).
-- `GET /metrics`: hourly-run success rate, quarantined/failed counts, bad batches caught, average rows and duration.
-- `GET /models`: recent registry entries with hold-out, per-horizon and rolling-origin metrics.
+- Trains persistence, seasonal-naive, Gradient Boosting, LSTM, and 1D CNN candidates.
+- Uses chronological splits and rolling-origin evaluation.
+- Uses validation data for early stopping and neural model selection.
+- Registers model versions and evaluation metadata.
+- Scores the active registered neural model for the next 24 hours.
+- Joins actual values to earlier forecasts as observations become available.
 
-## Evaluation integrity
+## Data and features
 
-Chronological 70/15/15 split (never shuffled between splits); a window belongs to a split by where its *target* falls; scalers are fitted on training rows only; rolling-origin folds are expanding windows. Reported: hold-out MAE/RMSE, error by forecast hour, rolling-origin mean ± std. If a baseline wins, the results say so ([results](docs/RESULTS.md)).
+The neural models use a **24-hour look-back window** with these eight input variables:
 
-## Tables
+| Feature | Description |
+|---|---|
+| PM2.5 | Fine particulate matter concentration |
+| PM10 | Coarse particulate matter concentration |
+| NO2 | Nitrogen dioxide |
+| O3 | Ozone |
+| Temperature | Air temperature |
+| Humidity | Relative humidity |
+| Precipitation | Precipitation |
+| Wind speed | Wind speed |
+
+**Input shape:** 24 time steps × 8 features  
+**Forecast output:** 24 hourly PM2.5 values
+
+The feature layer also stores lag features, rolling statistics, and calendar features. The default configured location is Bengaluru (latitude 12.9716, longitude 77.5946); it can be changed through environment configuration.
+
+## Model training and evaluation
+
+### Evaluation protocol
+
+- Chronological **70% / 15% / 15%** train, validation, and test split.
+- No random shuffling across time splits.
+- A sequence is assigned to a split based on where its target falls.
+- Scalers are fitted only on training data available before the evaluated block.
+- Rolling-origin evaluation uses expanding training windows across four folds.
+- Validation MAE is used for early stopping and neural-network selection.
+- Test metrics are reported separately and are not used for model selection.
+
+### Models compared
+
+| Model | Type |
+|---|---|
+| Persistence | Baseline — latest value carried forward |
+| Seasonal Naive | Baseline — previous-day value |
+| Gradient Boosting | Machine-learning baseline |
+| LSTM | Recurrent neural network |
+| 1D CNN | Convolutional neural network for time series |
+
+## Results
+
+The following results are from the committed evaluation report, generated on **11 November 2026**. The evaluation used **1,506 hourly observations**, **203 hold-out windows**, and **4 rolling-origin folds**.
+
+### Hold-out performance
+
+Lower MAE and RMSE indicate lower prediction error.
+
+| Model | Hold-out MAE | Hold-out RMSE | Rolling-origin MAE (mean ± std) |
+|---|---:|---:|---:|
+| Persistence | 7.188 | 8.982 | 8.458 ± 1.383 |
+| Seasonal Naive | 7.497 | 9.822 | 8.153 ± 1.510 |
+| **Gradient Boosting** | **7.180** | 9.589 | **7.268 ± 0.512** |
+| CNN | 9.459 | 11.364 | 9.510 ± 0.822 |
+| LSTM | 8.097 | 10.232 | 8.301 ± 1.580 |
+
+**Best hold-out MAE: Gradient Boosting (7.180).** It also achieved the lowest rolling-origin MAE mean (7.268).
+
+The neural models did not outperform the strongest baseline in this evaluation. The CNN hold-out MAE was 26.2% higher than seasonal naive, while LSTM was 8.0% higher. This is reported transparently rather than presenting the neural networks as the winning models.
+
+### Hold-out MAE by forecast horizon
+
+| Model | +1 hour | +6 hours | +12 hours | +18 hours | +24 hours |
+|---|---:|---:|---:|---:|---:|
+| Persistence | 1.96 | 6.56 | 8.32 | 8.59 | 7.46 |
+| Seasonal Naive | 7.59 | 7.50 | 7.54 | 7.49 | 7.46 |
+| Gradient Boosting | 2.38 | 6.26 | 7.04 | 9.03 | 9.34 |
+| CNN | 6.93 | 8.33 | 9.66 | 10.51 | 11.89 |
+| LSTM | 5.38 | 6.25 | 8.01 | 9.32 | 10.52 |
+
+### Registered model
+
+The latest recorded registry run selected the **LSTM** as the active neural model based on validation MAE:
+
+| Registry entry | Value |
+|---|---|
+| Active architecture | LSTM |
+| Model version | `lstm-20261111T174759Z-4e48ca5c` |
+| Validation MAE | 8.09375 |
+| CNN model version | `cnn-20261111T174759Z-a94a1a09` |
+| CNN validation MAE | 8.63667 |
+
+**Important distinction:** the active LSTM is the selected neural model in the registry; Gradient Boosting is the best model in the reported hold-out comparison. The API serves the active registered neural model, not necessarily the overall hold-out winner.
+
+See [docs/RESULTS.md](docs/RESULTS.md) for the generated report and [docs/MODEL_CARD.md](docs/MODEL_CARD.md) for intended use and evaluation details.
+
+## Data quality and reliability
+
+The committed quality report was generated from **one recorded hourly run**:
+
+| Runs | Successful | Failed | Quarantined | Observed success rate |
+|---:|---:|---:|---:|---:|
+| 1 | 1 | 0 | 0 | 100% |
+
+All seven recorded checks passed in that run: schema, key nulls, range, duplicates, continuity, freshness, and volume.
+
+> This is a one-run observation, not evidence of long-term reliability. A meaningful operational success rate requires several weeks of scheduled runs. No bad batch was recorded in this report.
+
+## Database design
 
 | Layer | Table | Purpose |
 |---|---|---|
-| Raw | `raw_api_responses` | Untouched JSON, request params, hash (purged after `RAW_RETENTION_DAYS`) |
-| Cleaned | `observations` | Typed hourly values, unique on `(location_id, ts_utc, source)` |
-| Features | `features_hourly` | Lags, rolling statistics, calendar features |
-| Serving | `predictions`, `model_registry` | Forecasts; model lineage, metrics, checkpoint |
-| Ops | `pipeline_runs`, `quality_results` | Per-run metadata (status, rows, duration, failed checks), per-check evidence |
+| Raw | `raw_api_responses` | Original source payloads, request parameters, and hashes |
+| Cleaned | `observations` | Typed hourly observations with a unique location/timestamp/source key |
+| Features | `features_hourly` | Lag, rolling, and calendar features |
+| Serving | `predictions` | Forecast values and timestamps |
+| Registry | `model_registry` | Model versions, artifacts, and evaluation metrics |
+| Operations | `pipeline_runs` | Run status, row counts, and duration |
+| Operations | `quality_results` | Evidence and outcomes for individual quality checks |
 
-## Verification
+Raw payload retention is configurable; the design currently specifies a 30-day retention period.
 
-```bash
-pip install -e '.[dev]'
-ruff check . && ruff format --check . && pytest -q
-pre-commit install            # ruff + gitleaks secret scan
-python scripts/evidence.py idempotency   # re-run a window: zero duplicates
-python scripts/evidence.py bad-batch     # corrupted batch quarantined, nothing loaded
-python scripts/evidence.py success-rate  # run success rate from real pipeline_runs
-python scripts/quality_report.py         # docs/DATA_QUALITY_REPORT.md from recorded runs
-python scripts/make_results.py           # docs/RESULTS.md from the model registry
+## API reference
+
+Start the stack and open the interactive API documentation at **http://localhost:8000/docs**.
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/health` | GET | Pipeline status, last successful run, data freshness, and active model |
+| `/predict?horizon=24` | GET | Latest forecast for the requested horizon |
+| `/metrics` | GET | Operational metrics for pipeline runs and quality outcomes |
+| `/models` | GET | Recent model registry entries and evaluation details |
+
+Example requests:
+
+```powershell
+Invoke-RestMethod "http://localhost:8000/health"
+Invoke-RestMethod "http://localhost:8000/models"
+Invoke-RestMethod "http://localhost:8000/predict?horizon=6"
 ```
 
-## Deployment
+The forecast endpoint returns the location, model version, issue timestamp, and forecast values. Future timestamps may have no corresponding actual value yet; actuals become available as time advances and new observations are ingested.
 
-See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md): `deploy/gcp/provision.sh` (Cloud SQL, secret, service accounts, GitHub OIDC), the opt-in `deploy-gcp.yml` workflow (tests → build → deploy API, dashboard and two Cloud Run jobs → smoke test → push-to-live timer), and `deploy/gcp/schedule.sh` (Cloud Scheduler). Cost and free-tier caveats are documented there.
+## Run locally
 
-## Documents
+### Prerequisites
 
-[Design decisions](docs/DESIGN_DECISIONS.md) · [Model card](docs/MODEL_CARD.md) · [Results](docs/RESULTS.md) · [Data terms & non-commercial question](docs/DATA_TERMS.md) · [Evidence checklist](docs/DEMO_CHECKLIST.md)
+- Git
+- Docker Desktop with Docker Compose
+- Python 3.11+ (for local development and tests)
 
-## Attribution
+### 1. Clone the repository
 
-Air-quality data: [Open-Meteo Air Quality API](https://open-meteo.com/en/docs/air-quality-api), based on **CAMS ENSEMBLE** model data (Copernicus Atmosphere Monitoring Service). Weather covariates: Open-Meteo. Data is [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). The dashboard repeats this attribution.
+```bash
+git clone https://github.com/RiyaPandey06/cloud-native-data-pipeline-with-deep-learning.git
+cd cloud-native-data-pipeline-with-deep-learning
+```
+
+### 2. Configure environment variables
+
+**Windows PowerShell:**
+
+```powershell
+Copy-Item .env.example .env
+```
+
+Review `.env` and update values if needed. Do not commit your real `.env`, API credentials, webhook URLs, or secrets. The committed `.env.example` contains safe template values.
+
+### 3. Start the services
+
+```powershell
+docker compose up --build
+```
+
+Once the containers are healthy:
+
+- API: http://localhost:8000
+- Interactive API docs: http://localhost:8000/docs
+- Streamlit dashboard: http://localhost:8501
+
+The scheduler performs the configured initial backfill and then continues with incremental hourly ingestion. The trainer waits for the minimum data requirement before scheduled retraining.
+
+### 4. Run a manual pipeline window
+
+```powershell
+docker compose run --rm scheduler python scripts/run_pipeline.py --start 2026-08-01 --end 2026-10-29
+```
+
+The operation can be repeated safely because database writes use idempotent upserts.
+
+### 5. Train models manually
+
+```powershell
+docker compose run --rm trainer python scripts/train_model.py --architecture all
+```
+
+You can also train one architecture:
+
+```powershell
+docker compose run --rm trainer python scripts/train_model.py --architecture lstm
+docker compose run --rm trainer python scripts/train_model.py --architecture cnn
+```
+
+### Optional: Airflow
+
+The project includes an optional Airflow DAG for local orchestration experiments:
+
+```powershell
+docker compose -f docker-compose.yml -f docker-compose.airflow.yml up --build db airflow
+```
+
+The Airflow path is optional and should not be interpreted as a verified production deployment.
+
+## Testing and code quality
+
+The project test suite and static checks were run during development:
+
+- **37 pytest tests passed**
+- Ruff lint checks passed
+- Ruff format checks passed
+
+To run the checks locally:
+
+```powershell
+pip install -e ".[dev]"
+ruff check .
+ruff format --check .
+pytest -q
+```
+
+Additional evidence/report commands:
+
+```powershell
+python scripts/evidence.py idempotency
+python scripts/evidence.py bad-batch
+python scripts/evidence.py success-rate
+python scripts/quality_report.py
+python scripts/make_results.py
+```
+
+Install the pre-commit hooks:
+
+```powershell
+pre-commit install
+```
+
+The hooks include Ruff checks and a Gitleaks secret scan.
+
+## Project structure
+
+```text
+.
+├── .github/workflows/       # CI and optional deployment workflows
+├── airflow/                 # Optional Airflow DAG
+├── artifacts/               # Model artifacts are kept out of Git
+├── deploy/gcp/               # Google Cloud deployment scripts
+├── docs/
+│   ├── architecture.png
+│   ├── architecture.mmd
+│   ├── RESULTS.md
+│   ├── DATA_QUALITY_REPORT.md
+│   ├── MODEL_CARD.md
+│   ├── DEPLOYMENT.md
+│   └── DESIGN_DECISIONS.md
+├── scripts/                  # Pipeline, scheduler, training, and reports
+├── src/air_quality_pipeline/ # Application and pipeline modules
+├── tests/                    # Automated tests
+├── docker-compose.yml
+├── docker-compose.airflow.yml
+├── Dockerfile
+├── pyproject.toml
+└── README.md
+```
+
+## Configuration
+
+Common settings are provided through `.env.example`. They include:
+
+| Setting | Purpose |
+|---|---|
+| Location name and coordinates | Select the forecast location |
+| `BACKFILL_DAYS` | Initial historical backfill window (default 90 days) |
+| `OVERLAP_HOURS` | Re-fetch overlap for late data/revisions (48 hours) |
+| `MAX_NULL_SHARE` | Maximum tolerated key-null share (1%) |
+| `RAW_RETENTION_DAYS` | Raw API payload retention (30 days) |
+| `FAILURE_WEBHOOK_URL` | Optional quality/failure alert destination |
+
+Check `.env.example` and the configuration module for the full list of supported variables and defaults.
+
+## Limitations and next steps
+
+- **Modelled target data:** CAMS ENSEMBLE output is not a ground-based pollution measurement.
+- **Short operational history:** the current quality report contains one successful run only; collect several weeks of runs before making reliability claims.
+- **Model performance:** Gradient Boosting and simple baselines outperform the neural models in the current hold-out evaluation. Improve feature engineering and gather more data before claiming a deep-learning performance advantage.
+- **Deployment:** deployment scripts and an opt-in workflow are included, but this repository's current evidence does not establish that a live cloud deployment is running.
+- **Airflow:** the optional DAG is included, but the design notes state that it has not been exercised against a live Airflow instance in this revision.
+- **Screenshots:** only the architecture diagram is currently committed; add genuine runtime screenshots after launching the local stack.
+
+## Documentation
+
+- [Model results](docs/RESULTS.md)
+- [Data quality report](docs/DATA_QUALITY_REPORT.md)
+- [Model card and intended use](docs/MODEL_CARD.md)
+- [Architecture and design decisions](docs/DESIGN_DECISIONS.md)
+- [Deployment guide](docs/DEPLOYMENT.md)
+- [Data terms](docs/DATA_TERMS.md)
+- [Portfolio evidence checklist](docs/DEMO_CHECKLIST.md)
+
+## Data attribution
+
+Air-quality data is obtained through the [Open-Meteo Air Quality API](https://open-meteo.com/en/docs/air-quality-api) and is based on the **Copernicus Atmosphere Monitoring Service (CAMS ENSEMBLE)**. Weather covariates are obtained from Open-Meteo. Review the provider's current terms and the project's [data terms notes](docs/DATA_TERMS.md). Data attribution is provided under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
+
+---
+
+<p align="center">
+  Built as an end-to-end demonstration of data engineering, time-series forecasting, and ML system operations.
+</p>
