@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: pip install --extra-index-url https://download.pytorch.org/whl/cpu '.[dev]'
+      - name: Lint
+        run: ruff check .
+      - name: Test
+        run: pytest -q
+      - name: Build image
+        run: docker build -t air-quality-pipeline:${{ github.sha }} .

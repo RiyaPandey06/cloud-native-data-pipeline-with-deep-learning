@@ -1,0 +1,38 @@
+flowchart LR
+  subgraph SRC[Source]
+    AQ[Open-Meteo Air Quality<br/>CAMS ENSEMBLE]
+    WX[Open-Meteo Weather]
+  end
+  subgraph ORCH[Orchestration]
+    SCH[Cron worker / Cloud Scheduler<br/>hourly :05, weekly Sun 03:00]
+    AF[Airflow DAG<br/>local, for screenshots]
+  end
+  subgraph PIPE[Hourly pipeline]
+    ING[1 ingest<br/>retry + backoff] --> RAW[(raw_api_responses)]
+    RAW --> VAL{2 quality gate}
+    VAL -- pass or warn --> LOAD[3 load<br/>upsert on key]
+    VAL -- fail or quarantine --> STOP[Run stopped<br/>alert sent]
+    LOAD --> OBS[(observations)]
+    LOAD --> FEAT[(features_hourly)]
+    OBS --> SCORE[4 score]
+  end
+  subgraph ML[Weekly training]
+    TRN[Baselines + LSTM + CNN<br/>hold-out and rolling origin] --> REG[(model_registry)]
+  end
+  AQ --> ING
+  WX --> ING
+  SCH --> ING
+  AF -.-> ING
+  SCH --> TRN
+  OBS --> TRN
+  REG --> SCORE
+  SCORE --> PRED[(predictions)]
+  VAL --> QR[(quality_results)]
+  PIPE --> RUNS[(pipeline_runs)]
+  PRED --> API[FastAPI<br/>/health /predict /metrics]
+  PRED --> DASH[Streamlit dashboard]
+  RUNS --> DASH
+  QR --> DASH
+  REG --> DASH
+  STOP --> HOOK[Chat webhook alert]
+  VAL -. warnings .-> HOOK

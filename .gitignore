@@ -1,0 +1,50 @@
+.env
+.env.*
+!.env.example
+
+# Python environments
+.venv/
+venv/
+env/
+.venv-*/
+__pycache__/
+*.py[cod]
+
+# Testing and linting
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Build files
+build/
+dist/
+*.egg-info/
+
+# Model artifacts
+artifacts/*.pt
+artifacts/*.pth
+artifacts/*.pkl
+artifacts/*.joblib
+artifacts/*.png
+
+# Local data and databases
+data/
+*.db
+*.sqlite
+*.sqlite3
+postgres_data/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Streamlit secrets
+.streamlit/secrets.toml

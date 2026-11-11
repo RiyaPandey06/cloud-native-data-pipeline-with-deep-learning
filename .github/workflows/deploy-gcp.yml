@@ -1,0 +1,69 @@
+name: Deploy to GCP
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+# This workflow is intentionally inert until ENABLE_GCP_DEPLOY is a repository variable set to true.
+# Required repository variables: GCP_PROJECT_ID, GCP_REGION, AR_REPOSITORY.
+# Required secrets: GCP_WIF_PROVIDER, GCP_SERVICE_ACCOUNT.
+# The Cloud Run runtime service account must be allowed to read the DATABASE_URL secret.
+env:
+  IMAGE_NAME: air-quality-pipeline
+
+jobs:
+  deploy:
+    if: vars.ENABLE_GCP_DEPLOY == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Configure Artifact Registry authentication
+        run: gcloud auth configure-docker ${{ vars.GCP_REGION }}-docker.pkg.dev --quiet
+      - name: Build and publish image
+        env:
+          IMAGE: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.AR_REPOSITORY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+        run: |
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+      - name: Deploy public API
+        env:
+          IMAGE: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.AR_REPOSITORY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+        run: |
+          gcloud run deploy air-quality-api \
+            --image "$IMAGE" --region ${{ vars.GCP_REGION }} --port 8000 \
+            --allow-unauthenticated --update-secrets DATABASE_URL=DATABASE_URL:latest
+      - name: Deploy public dashboard
+        env:
+          IMAGE: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.AR_REPOSITORY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+        run: |
+          gcloud run deploy air-quality-dashboard \
+            --image "$IMAGE" --region ${{ vars.GCP_REGION }} --port 8501 \
+            --command streamlit \
+            --args run,src/air_quality_pipeline/dashboard/app.py,--server.address,0.0.0.0,--server.port,8501 \
+            --allow-unauthenticated --update-secrets DATABASE_URL=DATABASE_URL:latest
+      - name: Deploy one-run ingestion job
+        env:
+          IMAGE: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.AR_REPOSITORY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+        run: |
+          gcloud run jobs deploy air-quality-hourly \
+            --image "$IMAGE" --region ${{ vars.GCP_REGION }} \
+            --command python --args scripts/run_pipeline.py \
+            --update-secrets DATABASE_URL=DATABASE_URL:latest
+      - name: Deploy weekly training job
+        env:
+          IMAGE: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.AR_REPOSITORY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+        run: |
+          gcloud run jobs deploy air-quality-weekly-train \
+            --image "$IMAGE" --region ${{ vars.GCP_REGION }} \
+            --command python --args scripts/train_model.py,--architecture,lstm \
+            --update-secrets DATABASE_URL=DATABASE_URL:latest
